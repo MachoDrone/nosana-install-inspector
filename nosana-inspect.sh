@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PUBLIC_DNS = {
     "8.8.8.8": "Google", "8.8.4.4": "Google",
     "2001:4860:4860::8888": "Google", "2001:4860:4860::8844": "Google",
@@ -557,16 +557,188 @@ if(found.length){console.log(JSON.stringify({name:"@nosana/node",installed_versi
         return self.rows
 
 
+def checklist(report):
+    """Translate collected evidence into a short checklist, without new probes."""
+    rows, items, used = report["checks"], [], set()
+
+    def select(ids):
+        selected = [(i, r) for i, r in enumerate(rows) if r["id"] in ids]
+        used.update(i for i, _ in selected)
+        return [r for _, r in selected]
+
+    def issue(row):
+        ident, detail = row["id"], row["detail"]
+        messages = {
+            "os.baseline": "This Ubuntu release is outside the tested 22.04/24.04 setup.",
+            "os.wsl": "WSL is outside the supported setup for this checker.",
+            "os.reboot": "Ubuntu reports that a reboot is needed. Schedule it when the host can be stopped.",
+            "gpu.host": "The NVIDIA GPU query failed; the GPU or driver needs investigation.",
+            "gpu.toolkit": "The NVIDIA container toolkit could not be checked.",
+            "gpu.persistence": "The NVIDIA persistence service is not confirmed running.",
+            "gpu.outer": "The existing container runtime could not query the GPU.",
+            "gpu.cdi": "GPU device configuration inside the container runtime could not be checked.",
+            "docker.user_access": "Your normal user cannot query Docker without sudo.",
+            "docker.group": "Your current login does not have Docker group access. A new login may be needed.",
+            "docker.context": "A Docker override is set; this checker inspected only the local Docker socket.",
+            "docker.daemon": "The local Docker daemon could not be reached.",
+            "runtime.node_stopped": "The Nosana node container is stopped.",
+            "runtime.outer_stopped": "The Podman container is stopped.",
+            "runtime.state_mount": "The container's Nosana data folder is missing or not writable.",
+            "runtime.node_state": "The node's data folder is missing or not writable.",
+            "runtime.node_socket": "The node's connection to its container provider is missing or unexpected.",
+            "runtime.socket_access": "The node cannot access its container-provider socket, or that check failed.",
+            "runtime.gateway": "The expected Nosana container network is missing, different, or could not be checked.",
+            "runtime.privileged": "The container is missing the privileged setting used by the standard launcher.",
+            "runtime.gpus": "The standard container GPU request is missing.",
+            "runtime.fuse": "The container is missing its expected /dev/fuse device.",
+            "runtime.mount": "A required container mount is missing or has unexpected access settings.",
+            "wallet.read_mode": "The wallet file allows group/other reads. Parent-folder permissions may still restrict who can reach it.",
+            "wallet.write_mode": "The wallet file allows group/other writes. Accounts that can reach it could alter it.",
+            "wallet.execute_mode": "The wallet file has unnecessary execute permissions.",
+            "wallet.runtime_access": "The node's access to its wallet or data folder could not be confirmed.",
+            "wallet.operator_access": "Your user cannot read the wallet or write its data folder for manual CLI use.",
+            "wallet.mapping": "The wallet's location could not be determined for this installation.",
+            "socket.other_mode": "The Docker socket allows other users to connect. Its permissions are too broad.",
+            "directory.other_write": "A checked folder allows other users to write into it.",
+            "network.clock": "The system clock is not confirmed synchronized.",
+            "cli.legacy_onboarding": "Host CLI 1.0.133 uses an obsolete onboarding endpoint. It is separate from the running container's node version.",
+            "logs.onboarding": "The supplied log contains the legacy onboarding error; it does not prove the wallet is blocked.",
+        }
+        if ident in ("network.dns", "network.outer_dns", "network.node_dns", "network.https"):
+            host = detail.split(" ", 1)[0].rstrip(":")
+            action = "HTTPS connection" if ident == "network.https" else "DNS lookup"
+            location = " inside a container" if ident in ("network.outer_dns", "network.node_dns") else ""
+            return "%s to %s%s %s." % (action, host, location, "timed out" if "timed out" in detail or "exit 28" in detail else "failed or could not be checked")
+        if ident.endswith(".acl"):
+            return "Extra file-access rules need review." if row["status"] == "WARN" else "Could not inspect extra file-access rules (ACLs)."
+        if ident.endswith(".metadata") or ident == "wallet.ancestors":
+            return "A required file or folder is missing, inaccessible, or could not be checked. Use --details for its path."
+        if ident == "storage.capacity":
+            return "Free disk space or free file entries are low." if row["status"] == "WARN" else "Could not check free space on a required filesystem."
+        if ident == "storage.writable_mount":
+            return "A required filesystem is read-only."
+        if ident.endswith("dns_policy"):
+            if row["status"] == "UNKNOWN":
+                return "Could not confirm the upstream DNS provider behind a local DNS proxy."
+            return detail.split(". This is", 1)[0].split(". Resolution", 1)[0].rstrip(".") + "."
+        return messages.get(ident, clean(detail))
+
+    def add(label, ok, explanations=()):
+        explanations = list(dict.fromkeys(explanations))
+        items.append({"ok": bool(ok), "label": label, "explanation": " ".join(explanations) if not ok else ""})
+
+    def group(label, required, extra=(), allow_info=False):
+        selected = select(set(required) | set(extra))
+        missing = set(required) - {r["id"] for r in selected}
+        bad = [r for r in selected if r["status"] in ("WARN", "FAIL", "UNKNOWN")]
+        ok = not missing and not bad and all(r["status"] == "PASS" or allow_info and r["status"] == "INFO" for r in selected)
+        explanations = [issue(r) for r in bad]
+        if missing or not explanations and not ok:
+            explanations.append("This check could not be completed for the detected installation.")
+        add(label, ok, explanations)
+
+    def endpoints(label, required):
+        selected = select(set(required))
+        bad = [r for r in selected if r["status"] != "PASS"]
+        missing = []
+        for ident in required:
+            seen = {r["detail"].split(" ", 1)[0].rstrip(":") for r in selected if r["id"] == ident}
+            missing += [host for host in ("api.nosana.com", "registry-1.docker.io") if host not in seen]
+        explanation = [issue(r) for r in bad]
+        if missing:
+            explanation.append("Not all required connections were checked; results are incomplete.")
+        add(label, not bad and not missing, explanation)
+
+    group("Ubuntu installation", ("os.baseline",), ("os.wsl",), allow_info=True)
+    group("NVIDIA GPU detected", ("gpu.host",))
+    group("NVIDIA container toolkit", ("gpu.toolkit", "gpu.persistence"))
+    group("GPU visible inside the container runtime", ("gpu.outer", "gpu.cdi"))
+    group("Docker access", ("docker.user_access",), ("docker.group", "docker.context", "docker.daemon"), allow_info=True)
+
+    outer = select({"runtime.outer"})
+    node = select({"runtime.node"})
+    stopped = select({"runtime.outer_stopped", "runtime.node_stopped"})
+    nested = bool(outer)
+    try:
+        running = bool(node) and all(json.loads(r.get("detail", "{}"))["running"] is True for r in node + outer)
+    except (ValueError, KeyError, TypeError):
+        running = False
+    add("Nosana containers running", running and not stopped,
+        [issue(r) for r in stopped] or ["Could not confirm a running Nosana container. No containers were started."])
+
+    config = ["runtime.node_state"]
+    if nested:
+        config += ["runtime.state_mount", "runtime.mount", "runtime.privileged", "runtime.gpus", "runtime.fuse", "runtime.node_socket", "runtime.socket_access", "runtime.gateway", "runtime.podman", "runtime.network_backend"]
+    group("Nosana container setup", config)
+    group("Free disk space and writable storage", ("storage.capacity", "storage.writable_mount"))
+    group("System clock synchronized", ("network.clock",))
+    group("No reboot pending", ("os.reboot",))
+
+    dns = select({"network.dns_policy", "network.outer_dns_policy"})
+    node_policy = select({"network.node_dns_policy"})
+    gateway = [r for r in rows if r["id"] == "runtime.gateway" and r["status"] == "PASS"]
+    node_servers = [r.get("evidence", "") for r in rows if r["id"] == "network.node_resolver"]
+    # A node using the verified standard bridge DNS is expected, not a fault.
+    expected_proxy = bool(gateway and node_servers) and all(dns_addresses(s) == ["192.168.101.1"] for s in node_servers)
+    dns += [r for r in node_policy if not (expected_proxy and r["status"] == "UNKNOWN")]
+    bad_dns = [r for r in dns if r["status"] != "PASS"]
+    explanation = [issue(r) for r in bad_dns]
+    if any(r["id"] == "network.dns_policy" and r["status"] == "UNKNOWN" for r in dns):
+        explanation = ["Could not confirm the host's live DNS servers."] + [issue(r) for r in bad_dns if r["id"] != "network.dns_policy"]
+        if any(r["id"] == "network.upstream_file_policy" and "matches suggested Google" in r["detail"] for r in rows):
+            explanation.append("Its saved DNS settings list Google, but the live settings query did not answer.")
+    have_host = any(r["id"] == "network.dns_policy" for r in dns)
+    have_outer = not nested or any(r["id"] == "network.outer_dns_policy" for r in dns)
+    if not have_host or not have_outer:
+        explanation.append("DNS settings could not be fully checked.")
+    add("Google/Cloudflare DNS settings", have_host and have_outer and not bad_dns, explanation)
+
+    if not any(r["id"] == "network.external" and r["status"] == "SKIP" for r in rows):
+        dns_ids = ["network.dns"] + (["network.outer_dns", "network.node_dns"] if nested else [])
+        endpoints("DNS lookups", dns_ids)
+        endpoints("HTTPS connections to Nosana and Docker", ("network.https",))
+    group("Nosana can access its wallet", ("wallet.runtime_access",), ("wallet.mapping", "wallet.operator_access"), allow_info=True)
+    group("Wallet file permissions", ("wallet.metadata", "wallet.acl", "wallet.ancestors"),
+          ("wallet.read_mode", "wallet.write_mode", "wallet.execute_mode", "wallet.type"), allow_info=True)
+    permission_ids = {r["id"] for r in rows if r["id"].startswith(("directory.", "socket.", "device.")) and r["id"] not in ("directory.symlink", "socket.symlink")}
+    group("Folder and Docker socket permissions", ("socket.metadata", "socket.acl"), permission_ids, allow_info=True)
+
+    # Keep any other explicit problems visible without dumping optional inventory.
+    for i, row in enumerate(rows):
+        if i not in used and row["status"] in ("WARN", "FAIL"):
+            label = "Legacy CLI onboarding" if row["id"] == "cli.legacy_onboarding" else "Additional finding"
+            add(label, False, [issue(row)])
+    return items
+
+
+def render_checklist(report):
+    items = checklist(report)
+    lines = ["Nosana installation check — %s" % clean(report.get("host", "host")), ""]
+    for item in items:
+        lines.append(("✅ " if item["ok"] else "❌ ") + item["label"])
+        if not item["ok"]:
+            lines.append("   " + item["explanation"])
+    count = sum(not item["ok"] for item in items)
+    lines += ["", "%d passed · %d need attention" % (len(items)-count, count),
+              "Read-only — no settings changed. Details: --details or --json."]
+    if any(r["id"] == "network.external" and r["status"] == "SKIP" for r in report["checks"]):
+        lines.append("Internet tests were not run. Add --network to include them.")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sudo", action="store_true", help="allow noninteractive sudo for selected metadata queries; does not prompt")
     parser.add_argument("--network", action="store_true", help="perform bounded public DNS/HTTPS transport probes (no registration)")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    parser.add_argument("--details", action="store_true", help="show the full technical report instead of the short checklist")
     parser.add_argument("--log", metavar="PATH", help="opt-in local log signature counts only, last 2 MiB; never prints raw logs")
     args = parser.parse_args()
     if os.geteuid() == 0:
         parser.error("Run as the normal host user, not sudo python3; use --sudo for optional privileged metadata")
     start = time.monotonic()
+    if not args.json and not args.details:
+        print("Checking installation…", flush=True)
     inspector = Inspector(args)
     rows = inspector.collect()
     counts = dict(collections.Counter(r["status"] for r in rows))
@@ -575,7 +747,7 @@ def main():
               "counts": counts, "checks": rows}
     if args.json:
         print(json.dumps(report, indent=2))
-    else:
+    elif args.details:
         print("Nosana installation inspection %s | %s | %s" % (VERSION, report["host"], report["utc"]))
         for row in rows:
             print("[%s] %s: %s" % (row["status"], row["id"], row["detail"]))
@@ -583,7 +755,9 @@ def main():
                 print("  " + row["evidence"].replace("\n", "\n  "))
         print("Summary: %s | %.2fs" % (json.dumps(counts, sort_keys=True), report["duration_seconds"]))
         print("PASS refers to the named check only. WARN/UNKNOWN need context; this is not a qualification result.")
-    return 2 if counts.get("FAIL") else 1 if counts.get("WARN") else 0
+    else:
+        print(render_checklist(report))
+    return 2 if counts.get("FAIL") else 1 if counts.get("WARN") or any(not item["ok"] for item in checklist(report)) else 0
 
 
 if __name__ == "__main__":

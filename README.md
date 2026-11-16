@@ -4,6 +4,19 @@ A read-only checker for Ubuntu Nosana installations, including the standard
 Podman-in-Docker launcher and legacy manual CLI attempts. Run it as your normal
 host user. It inspects the existing installation without starting a host or job.
 
+The default output is a short checklist: **✅ passed** or **❌ needs attention**.
+Each red item includes a plain-English explanation. A red item can mean a
+problem was found or a required check could not finish; it never silently
+turns missing evidence into a green check.
+
+```text
+✅ NVIDIA GPU detected
+✅ Docker access
+✅ DNS lookups
+❌ Wallet file permissions
+   The wallet file allows group/other reads. Parent-folder permissions may still restrict who can reach it.
+```
+
 ## Run directly from GitHub
 
 No predownload, clone, chmod, temporary script, or dependency installation:
@@ -79,6 +92,7 @@ and DNS caches may record those queries.
 | --- | --- |
 | `--network` | Optional public DNS and HTTPS probes; no registration request |
 | `--sudo` | Selected noninteractive privileged metadata queries; never prompts |
+| `--details` | Full technical report, including optional inventory and diagnostic fields |
 | `--json` | Structured output for comparing hosts |
 | `--log /path/to/install.log` | Signature counts from the last 2 MiB; no raw log output |
 | `--help` | Usage only |
@@ -96,10 +110,16 @@ included. Error stderr is deliberately omitted to avoid credential leakage;
 timeouts and incomplete checks remain explicit. Log scanning is opt-in and
 refuses conventional wallet/key paths, including symlinks to them.
 
-`PASS` means the named check passed, **not** that the host qualified. `WARN`
-requires context; `FAIL` identifies a specific unacceptable condition;
-`UNKNOWN` means evidence is incomplete; `INFO` and `SKIP` describe scope.
-Exit codes: `0` no warnings/failures (unknowns may remain), `1` warnings,
+The default checklist groups related checks and omits routine inventory. A
+normal container DNS proxy is not itself an error. An absent optional native
+service is not displayed as a passing service-health check. Use `--details` or
+`--json` for all collected evidence. Neither output proves host qualification.
+
+In the detailed report, `PASS` means the named query/check passed, `WARN` needs
+context, `FAIL` identifies a specific unacceptable condition, and `UNKNOWN`
+means evidence is incomplete. `INFO` and `SKIP` describe scope.
+Exit codes: `0` no checklist issues/warnings/failures (optional inventory may
+still be unknown), `1` warnings or incomplete required checks,
 `2` failures or invalid invocation, `3` missing Python in the Bash launcher.
 
 Python 3.8+ and Bash are required; standard Ubuntu includes Python 3. Other
